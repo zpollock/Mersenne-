@@ -20,8 +20,7 @@ bool isMersennePrime(std::uint64_t p) {
 
     ByteArray s = ByteArray::fromString("100");   // s0 = 4
     for (std::size_t i = 0; i + 2 < p; ++i) {     // p-2 squarings
-        ByteArray t = s.multiply(s);
-        t = t.modMersenne(p);                     // s^2 mod M_p
+        ByteArray t = s.squareModMersenne(p);     // s^2 mod M_p (fused DWT)
         if (t.greaterEqual(two)) {
             t = t.minus(two);                     // -2
         } else {                                  // wrap to the top of the range

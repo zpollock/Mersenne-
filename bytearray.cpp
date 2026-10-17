@@ -1,6 +1,8 @@
 #include "bytearray.h"
 
 #include <algorithm>
+#include <cmath>
+#include <complex>
 #include <stdexcept>
 
 #include <iostream>  // for appendOne() / print()
@@ -75,6 +77,54 @@ Bl qmul4plus1(const Bl& Q) {
     return T;
 }
 
+// Iterative radix-2 Cooley-Tukey FFT on std::complex<double>.
+// Converts a vector of limbs to/from the frequency domain. The inverse pass
+// (invert = true) also divides by N. Used for convolution-based multiplication.
+void fft(std::vector<std::complex<double>>& a, bool invert) {
+    const std::size_t n = a.size();
+    if (n < 2) return;
+
+    // Bit-reversal permutation.
+    for (std::size_t i = 1, j = 0; i < n; ++i) {
+        std::size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+
+    // Roots computed directly (not by repeated multiplication), cached per n.
+    // sin/cos in long double keep the accumulated error tiny even for large
+    // transforms and for the many same-size FFTs in a Lucas-Lehmer run.
+    static std::size_t cachedN = 0;
+    static std::vector<std::complex<double>> roots;   // exp(-2*pi*i*k/n), k < n/2
+    if (cachedN != n) {
+        roots.assign(n / 2, std::complex<double>(0, 0));
+        const long double pi = std::acos(-1.0L);
+        for (std::size_t k = 0; k < n / 2; ++k) {
+            const long double ang = 2.0L * pi * k / n;
+            roots[k] = std::complex<double>(double(std::cos(ang)), double(-std::sin(ang)));
+        }
+        cachedN = n;
+    }
+
+    for (std::size_t len = 2; len <= n; len <<= 1) {
+        const std::size_t half = len / 2, step = n / len;
+        for (std::size_t i = 0; i < n; i += len) {
+            for (std::size_t j = 0; j < half; ++j) {
+                std::complex<double> w = roots[j * step];
+                if (invert) w = std::conj(w);
+                std::complex<double> u = a[i + j];
+                std::complex<double> v = a[i + j + half] * w;
+                a[i + j] = u + v;
+                a[i + j + half] = u - v;
+            }
+        }
+    }
+
+    if (invert)
+        for (std::complex<double>& x : a) x /= static_cast<double>(n);
+}
+
 }  // namespace
 
 void ByteArray::append(std::uint8_t bit) {
@@ -89,6 +139,8 @@ void ByteArray::appendOne() {
 }
 
 std::size_t ByteArray::size() const { return size_; }
+
+bool ByteArray::getBit(std::size_t i) const { return bit(i); }
 
 void ByteArray::print(std::size_t maxBits) const {
     std::string s;
@@ -231,6 +283,72 @@ ByteArray ByteArray::minus(const ByteArray& other) const {
 }
 
 ByteArray ByteArray::multiply(const ByteArray& other) const {
+    if (isZero() || other.isZero()) {
+        ByteArray z;
+        z.setZero();
+        return z;
+    }
+
+    // The FFT path only wins on large operands; schoolbook is cheaper and
+    // identical in result for small ones, so switch on a bit-length threshold.
+    const std::size_t maxBits = std::max(size_, other.size_);
+    if (maxBits < 1024) return multiplySchoolbook(other);
+
+    // Choose chunk size c so no convolution coefficient over a double's exact
+    // integer range. The largest coefficient is ~n * (2^c)^2 (n limbs), so we
+    // need log2(n) + 2c comfortably below 53; use 45 for FFT error headroom.
+    std::size_t c = 30;
+    while (c > 1) {
+        const std::size_t n = (maxBits + c - 1) / c;
+        const long double lb = std::log2(static_cast<long double>(n))
+                             + 2.0L * static_cast<long double>(c);
+        if (lb < 45.0L) break;
+        --c;
+    }
+
+    std::vector<std::uint64_t> A = toLimbs(c);
+    std::vector<std::uint64_t> B = other.toLimbs(c);
+
+    std::size_t need = A.size() + B.size() - 1;
+    std::size_t N = 1;
+    while (N < need) N <<= 1;
+
+    std::vector<std::complex<double>> FA(N), FB(N);
+    for (std::size_t i = 0; i < A.size(); ++i)
+        FA[i] = std::complex<double>(static_cast<double>(A[i]), 0.0);
+    for (std::size_t i = 0; i < B.size(); ++i)
+        FB[i] = std::complex<double>(static_cast<double>(B[i]), 0.0);
+
+    fft(FA, false);
+    fft(FB, false);
+    for (std::size_t i = 0; i < N; ++i) FA[i] *= FB[i];
+    fft(FA, true);
+
+    // Round the (near-integer) coefficients and propagate the base-2^c carry.
+    const std::uint64_t mask = (std::uint64_t(1) << c) - 1;
+    std::vector<std::uint64_t> prod;
+    prod.reserve(need + 1);
+    std::uint64_t carry = 0;
+    for (std::size_t i = 0; i < need; ++i) {
+        const long long r = std::llround(FA[i].real());
+        // A tiny negative FFT residue could round below zero; clamp so the
+        // cast to uint64_t doesn't wrap around to a huge value.
+        const std::uint64_t coeff = r > 0
+                                      ? static_cast<std::uint64_t>(r)
+                                      : std::uint64_t(0);
+        const std::uint64_t total = coeff + carry;
+        prod.push_back(total & mask);
+        carry = total >> c;
+    }
+    while (carry) {
+        prod.push_back(carry & mask);
+        carry >>= c;
+    }
+
+    return fromLimbs(prod, c);
+}
+
+ByteArray ByteArray::multiplySchoolbook(const ByteArray& other) const {
     ByteArray acc;
     acc.setZero();
     for (std::size_t j = 0; j < other.size_; ++j) {
@@ -240,6 +358,40 @@ ByteArray ByteArray::multiply(const ByteArray& other) const {
         acc = acc.add(shifted);
     }
     return acc;
+}
+
+std::vector<std::uint64_t> ByteArray::toLimbs(std::size_t c) const {
+    const std::size_t n = (size_ + c - 1) / c;
+    std::vector<std::uint64_t> v(n, 0);
+    for (std::size_t i = 0; i < size_; ++i) {
+        if (!bit(i)) continue;
+        const std::size_t g = size_ - 1 - i;      // little-endian bit index
+        const std::size_t limb = g / c, off = g % c;
+        v[limb] |= std::uint64_t(1) << off;
+    }
+    return v;
+}
+
+ByteArray ByteArray::fromLimbs(const std::vector<std::uint64_t>& limbs,
+                               std::size_t c) {
+    // Highest set bit across all limbs: limb i covers global bits [i*c, i*c+c).
+    std::size_t highest = 0;   // highest global bit index
+    for (std::size_t i = 0; i < limbs.size(); ++i) {
+        std::uint64_t v = limbs[i];
+        if (!v) continue;
+        std::size_t h = 0;
+        while (v >>= 1) ++h;
+        highest = std::max(highest, i * c + h);
+    }
+
+    ByteArray r;
+    r.size_ = highest + 1;
+    r.data_.assign((r.size_ + 7) / 8, 0);
+    for (std::size_t i = 0; i < limbs.size(); ++i)
+        for (std::size_t b = 0; b < c; ++b)
+            if ((limbs[i] >> b) & 1u)
+                r.setBit(r.size_ - 1 - (i * c + b), true);
+    return r;
 }
 
 ByteArray ByteArray::modMersenne(std::size_t p) const {
@@ -264,6 +416,107 @@ ByteArray ByteArray::modMersenne(std::size_t p) const {
         if (allOnes) return ByteArray::fromString("0");
     }
     return x;
+}
+
+ByteArray ByteArray::squareModMersenne(std::size_t p) const {
+    // Weighted (Mersenne) DWT: split this (< 2^p) into n weighted limbs and do
+    // a single cyclic transform of length n, so the result is s^2 mod (2^p-1)
+    // with no separate post-square fold. n is a power of two.
+    //
+    // Use ceil limb positions lo[i] = ceil(i*p/n) (with lo[0]=0, lo[n]=p).
+    // Along with weights w[i] = 2^(lo[i] - i*p/n) >= 1 applied forward and
+    // divided out on the way back, the product terms come out as exact
+    // integers (floor positions would make them half-integers and corrupt the
+    // rounding).
+    std::size_t n = 1;
+    for (;;) {
+        const std::size_t maxc = (p + n - 1) / n;          // ceil(p/n)
+        const long double lb = std::log2(static_cast<long double>(n))
+                             + 2.0L * static_cast<long double>(maxc);
+        if (n >= 2 && lb < 50.0L) break;                   // exact in double
+        n <<= 1;
+    }
+
+    // Split into weighted digits.
+    std::vector<std::uint64_t> d(n, 0);
+    std::vector<std::uint64_t> width(n);
+    std::vector<std::uint64_t> lo(n);
+    std::vector<double> w(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const unsigned __int128 lo128 = ((unsigned __int128)i * p + n - 1) / n;  // ceil
+        const unsigned __int128 hi128 = ((unsigned __int128)(i + 1) * p + n - 1) / n;
+        lo[i] = static_cast<std::uint64_t>(lo128);
+        width[i] = static_cast<std::uint64_t>(hi128 - lo128);
+
+        std::uint64_t v = 0;
+        for (std::uint64_t b = 0; b < width[i]; ++b) {
+            if (lo[i] + b < size_ && bit(size_ - 1 - (lo[i] + b)))
+                v |= std::uint64_t(1) << b;
+        }
+        d[i] = v;
+
+        const unsigned __int128 rem = ((unsigned __int128)i * p) % n;
+        const unsigned __int128 k = (n - rem) % n;         // lo[i]*n - i*p <= n-1
+        w[i] = std::pow(2.0, static_cast<double>(k) / static_cast<double>(n));
+    }
+
+    // One forward transform, pointwise square, one inverse transform.
+    std::vector<std::complex<double>> A(n);
+    for (std::size_t i = 0; i < n; ++i)
+        A[i] = std::complex<double>(static_cast<double>(d[i]) * w[i], 0.0);
+    fft(A, false);
+    for (std::size_t i = 0; i < n; ++i) A[i] = A[i] * A[i];
+    fft(A, true);
+
+    // Divide out the weights, round to integers, then propagate carries
+    // cyclically (the carry that leaves the top limb wraps back onto limb 0,
+    // which IS the mod-(2^p-1) reduction).
+    std::vector<std::uint64_t> g(n);
+    for (std::size_t i = 0; i < n; ++i)
+        g[i] = static_cast<std::uint64_t>(std::llround(A[i].real() / w[i]));
+
+    for (int pass = 0; pass < 16; ++pass) {
+        std::uint64_t carry = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t base = std::uint64_t(1) << width[i];
+            const std::uint64_t v = g[i] + carry;
+            g[i] = v % base;
+            carry = v / base;
+        }
+        if (carry == 0) break;
+        g[0] += carry;                 // cyclic wrap: feed it back into limb 0
+    }
+
+    // Reassemble the residue (value = sum g_i * 2^lo[i]) as an MSB-first array.
+    std::size_t highest = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        std::uint64_t v = g[i];
+        if (!v) continue;
+        std::size_t h = 0;
+        while (v >>= 1) ++h;
+        if (lo[i] + h > highest) highest = lo[i] + h;
+    }
+
+    ByteArray r;
+    r.size_ = highest + 1;
+    r.data_.assign((r.size_ + 7) / 8, 0);
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::uint64_t b = 0; b < width[i]; ++b)
+            if ((g[i] >> b) & 1u)
+                r.setBit(r.size_ - 1 - (lo[i] + b), true);
+
+    // A canonical Mersenne residue never equals M; if it came out all ones
+    // (value == 2^p - 1) the true residue is 0.
+    if (r.size_ == p + 1) {
+        r.stripLeadingZeros();
+    }
+    if (r.size() == p) {
+        bool allOnes = true;
+        for (std::size_t i = 0; i < p; ++i)
+            if (!r.bit(i)) { allOnes = false; break; }
+        if (allOnes) return ByteArray::fromString("0");
+    }
+    return r;
 }
 
 bool ByteArray::greaterEqual(const ByteArray& other) const {

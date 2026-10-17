@@ -20,6 +20,9 @@ public:
 
     std::size_t size() const;
 
+    // Returns the bit at position i (0 = most significant bit).
+    bool getBit(std::size_t i) const;
+
     // Prints up to maxBits bits (from the most significant side).
     void print(std::size_t maxBits = 64) const;
 
@@ -48,12 +51,21 @@ public:
     // Returns this - other (requires this >= other).
     ByteArray minus(const ByteArray& other) const;
 
-    // Returns this * other (schoolbook shift-and-add).
+    // Returns this * other. Uses an FFT-based multiplication on base-2^c limbs
+    // for large operands, falling back to schoolbook shift-and-add for small
+    // ones. Both paths produce an identical exact result.
     ByteArray multiply(const ByteArray& other) const;
 
     // Returns this mod (2^p - 1), a value in [0, 2^p - 1], by repeatedly
     // folding the high bits down (2^p ≡ 1 mod (2^p - 1)).
     ByteArray modMersenne(std::size_t p) const;
+
+    // Returns (this * this) mod (2^p - 1). The Mersenne reduction is fused
+    // into the transform via a weighted (Mersenne) DWT: the operand is split
+    // into n weighted limbs and a single cyclic transform of length n yields
+    // the residue directly, so no value ever exceeds p bits and no separate
+    // post-square fold is needed. Only meaningful when this < 2^p.
+    ByteArray squareModMersenne(std::size_t p) const;
 
     // True if this array's value is greater than or equal to other's.
     bool greaterEqual(const ByteArray& other) const;
@@ -83,6 +95,12 @@ private:
     void setZero();
     // Removes leading (most-significant) zeros so size() is the true bit length.
     void stripLeadingZeros();
+    // Base-2^c little-endian limb decomposition of this array.
+    std::vector<std::uint64_t> toLimbs(std::size_t c) const;
+    // Builds an array from a base-2^c little-endian limb vector.
+    static ByteArray fromLimbs(const std::vector<std::uint64_t>& limbs, std::size_t c);
+    // Shift-and-add multiplication; the FFT path's fallback for small operands.
+    ByteArray multiplySchoolbook(const ByteArray& other) const;
 
     std::vector<std::uint8_t> data_;  // packed bytes
     std::size_t size_ = 0;            // number of bits
