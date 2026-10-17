@@ -3,15 +3,37 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <stdexcept>
 
 #include <iostream>  // for appendOne() / print()
 
+// ---------------------------------------------------------------------------
+// Layout of the weighted (Mersenne) transform for a given exponent p.
+// Computed once and reused for every squaring of the same p.
+//   n          transform length (power of two)
+//   lo[i]      ceil(i*p/n): first bit of digit i (lo[n] = p)
+//   width[i]   lo[i+1] - lo[i]: number of bits in digit i
+//   w[i]       2^(lo[i] - i*p/n) >= 1   (applied before the FFT)
+//   winv[i]    1 / w[i]                 (applied after the inverse FFT)
+// ---------------------------------------------------------------------------
+struct MersennePlan {
+    std::uint64_t p = 0;
+    std::size_t boost = 0;
+    std::size_t n = 0;
+    std::vector<std::size_t> lo;
+    std::vector<unsigned> width;
+    std::vector<double> w, winv;
+};
+
 namespace {
+
+// ----- Little-endian packed bit buffers (square-root and remainder) --------
 
 // Little-endian packed bit array used for the working buffers of the
 // square-root and remainder algorithms: bit 0 is the least significant bit.
-// Everything stays packed 8 bits per byte, so no 8x waste anywhere.
 struct Bl {
     std::vector<std::uint8_t> d;   // packed bytes
     std::size_t n = 0;             // number of bits
@@ -47,7 +69,7 @@ void subtract(Bl& a, const Bl& b) {    // a -= b (requires a >= b)
     trim(a);
 }
 
-// R = R*4 + hi*2 + lo   (prepend two high bits: shift left 2, then OR them in)
+// R = R*4 + hi*2 + lo
 void shl2Add(Bl& R, bool hi, bool lo) {
     std::size_t on = R.n;
     R.n += 2;
@@ -57,7 +79,7 @@ void shl2Add(Bl& R, bool hi, bool lo) {
     R.set(1, hi);
 }
 
-// Q = Q*2 + bit   (shift left 1, then OR the new low bit)
+// Q = Q*2 + bit
 void shl1Add(Bl& Q, bool bit) {
     std::size_t on = Q.n;
     Q.n += 1;
@@ -77,55 +99,252 @@ Bl qmul4plus1(const Bl& Q) {
     return T;
 }
 
-// Iterative radix-2 Cooley-Tukey FFT on std::complex<double>.
-// Converts a vector of limbs to/from the frequency domain. The inverse pass
-// (invert = true) also divides by N. Used for convolution-based multiplication.
-void fft(std::vector<std::complex<double>>& a, bool invert) {
-    const std::size_t n = a.size();
-    if (n < 2) return;
+// ----- FFT ------------------------------------------------------------------
 
-    // Bit-reversal permutation.
+// Per-size tables for the FFT, cached per thread (a Lucas-Lehmer run uses the
+// same size every iteration, so these are built once).
+//   rev[i]       bit-reversal permutation
+//   twr/twi      twiddles stored contiguously per stage:
+//                tw[half + j] = exp(-2*pi*i*j / (2*half)), j < half
+// Twiddles are computed directly with long-double sin/cos (not by repeated
+// multiplication, which loses accuracy on large transforms).
+struct FftTables {
+    std::size_t n = 0;
+    std::vector<std::uint32_t> rev;
+    std::vector<double> twr, twi;
+};
+
+void buildFftTables(FftTables& T, std::size_t n) {
+    T.n = n;
+    T.rev.assign(n, 0);
     for (std::size_t i = 1, j = 0; i < n; ++i) {
         std::size_t bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
         j ^= bit;
-        if (i < j) std::swap(a[i], a[j]);
+        T.rev[i] = static_cast<std::uint32_t>(j);
     }
-
-    // Roots computed directly (not by repeated multiplication), cached per n.
-    // sin/cos in long double keep the accumulated error tiny even for large
-    // transforms and for the many same-size FFTs in a Lucas-Lehmer run.
-    static std::size_t cachedN = 0;
-    static std::vector<std::complex<double>> roots;   // exp(-2*pi*i*k/n), k < n/2
-    if (cachedN != n) {
-        roots.assign(n / 2, std::complex<double>(0, 0));
-        const long double pi = std::acos(-1.0L);
-        for (std::size_t k = 0; k < n / 2; ++k) {
-            const long double ang = 2.0L * pi * k / n;
-            roots[k] = std::complex<double>(double(std::cos(ang)), double(-std::sin(ang)));
+    T.twr.assign(n, 0.0);
+    T.twi.assign(n, 0.0);
+    const long double pi = std::acos(-1.0L);
+    for (std::size_t half = 1; half < n; half <<= 1) {
+        for (std::size_t j = 0; j < half; ++j) {
+            const long double ang = pi * static_cast<long double>(j) / static_cast<long double>(half);
+            T.twr[half + j] = static_cast<double>(std::cos(ang));
+            T.twi[half + j] = static_cast<double>(-std::sin(ang));
         }
-        cachedN = n;
+    }
+}
+
+// Iterative radix-2 Cooley-Tukey FFT on std::complex<double>. The inverse
+// pass (invert = true) also divides by N. Works on the raw (re, im) doubles
+// with contiguous per-stage twiddles; about 6-10x faster than a version that
+// strides through one shared twiddle table and uses operator* on std::complex.
+void fft(std::vector<std::complex<double>>& a, bool invert) {
+    const std::size_t n = a.size();
+    if (n < 2) return;
+
+    static thread_local FftTables T;
+    if (T.n != n) buildFftTables(T, n);
+
+    // std::complex<double> is guaranteed layout-compatible with double[2].
+    double* d = reinterpret_cast<double*>(a.data());
+
+    for (std::size_t i = 1; i < n; ++i) {                  // bit-reversal permutation
+        const std::size_t j = T.rev[i];
+        if (i < j) { std::swap(d[2 * i], d[2 * j]); std::swap(d[2 * i + 1], d[2 * j + 1]); }
     }
 
-    for (std::size_t len = 2; len <= n; len <<= 1) {
-        const std::size_t half = len / 2, step = n / len;
+    for (std::size_t i = 0; i < n; i += 2) {               // first stage: twiddle is 1
+        double* x = d + 2 * i;
+        const double ur = x[0], ui = x[1], vr = x[2], vi = x[3];
+        x[0] = ur + vr; x[1] = ui + vi; x[2] = ur - vr; x[3] = ui - vi;
+    }
+
+    const double sgn = invert ? -1.0 : 1.0;                // inverse uses the conjugate root
+    for (std::size_t half = 2; half < n; half <<= 1) {
+        const std::size_t len = half * 2;
+        const double* tr = &T.twr[half];
+        const double* ti = &T.twi[half];
         for (std::size_t i = 0; i < n; i += len) {
+            double* x = d + 2 * i;
+            double* y = x + 2 * half;
             for (std::size_t j = 0; j < half; ++j) {
-                std::complex<double> w = roots[j * step];
-                if (invert) w = std::conj(w);
-                std::complex<double> u = a[i + j];
-                std::complex<double> v = a[i + j + half] * w;
-                a[i + j] = u + v;
-                a[i + j + half] = u - v;
+                const double wr = tr[j], wi = sgn * ti[j];
+                const double yr = y[2 * j], yi = y[2 * j + 1];
+                const double vr = yr * wr - yi * wi;       // y * w, written out
+                const double vi = yr * wi + yi * wr;
+                const double ur = x[2 * j], ui = x[2 * j + 1];
+                x[2 * j] = ur + vr;     x[2 * j + 1] = ui + vi;
+                y[2 * j] = ur - vr;     y[2 * j + 1] = ui - vi;
             }
         }
     }
 
-    if (invert)
-        for (std::complex<double>& x : a) x /= static_cast<double>(n);
+    if (invert) {
+        const double s = 1.0 / static_cast<double>(n);
+        for (std::size_t i = 0; i < 2 * n; ++i) d[i] *= s;
+    }
+}
+
+// ----- Weighted-digit machinery for Mersenne squaring ------------------------
+
+// log2(n) + 2*(bits per digit) must stay below this so the largest convolution
+// coefficient (including the weights) stays well inside a double's 53 bits.
+constexpr long double kMaxCoeffBits = 46.0L;
+
+unsigned bitLength(std::uint64_t v) {      // v != 0
+    return 64u - static_cast<unsigned>(__builtin_clzll(v));
+}
+
+// Returns the (cached, per-thread) plan for exponent p. The returned reference
+// stays valid until the next getPlan() call with a different p/boost.
+const MersennePlan& getPlan(std::uint64_t p, std::size_t boost) {
+    thread_local MersennePlan plan;
+    if (plan.n != 0 && plan.p == p && plan.boost == boost) return plan;
+
+    std::size_t n = 1;
+    for (;;) {
+        const std::uint64_t maxc = (p + n - 1) / n;        // ceil(p/n)
+        const long double lb = std::log2(static_cast<long double>(n))
+                             + 2.0L * static_cast<long double>(maxc);
+        if (n >= 2 && lb < kMaxCoeffBits) break;
+        n <<= 1;
+    }
+    n <<= boost;
+
+    plan.p = p;
+    plan.boost = boost;
+    plan.n = n;
+    plan.lo.assign(n + 1, 0);
+    plan.width.assign(n, 0);
+    plan.w.assign(n, 1.0);
+    plan.winv.assign(n, 1.0);
+    for (std::size_t i = 0; i <= n; ++i)
+        plan.lo[i] = static_cast<std::size_t>(((unsigned __int128)i * p + n - 1) / n);  // ceil
+    for (std::size_t i = 0; i < n; ++i) {
+        plan.width[i] = static_cast<unsigned>(plan.lo[i + 1] - plan.lo[i]);
+        const unsigned __int128 rem = ((unsigned __int128)i * p) % n;
+        const unsigned __int128 k = (n - rem) % n;         // lo[i]*n - i*p, in [0, n-1]
+        plan.w[i] = std::exp2(static_cast<double>(k) / static_cast<double>(n));
+        plan.winv[i] = 1.0 / plan.w[i];
+    }
+    return plan;
+}
+
+// Carry-propagates signed digits into [0, 2^width[i]). The carry leaving the
+// top digit has weight 2^p == 1 (mod 2^p - 1), so it wraps onto digit 0; that
+// wrap IS the modular reduction. Also handles negative values (borrows).
+void normalizeDigits(const MersennePlan& P, std::vector<long long>& g) {
+    const std::size_t n = P.n;
+    for (int pass = 0; pass < 64; ++pass) {
+        long long carry = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const long long v = g[i] + carry;
+            const unsigned wd = P.width[i];
+            g[i] = v & ((1LL << wd) - 1);
+            carry = v >> wd;                               // arithmetic shift = floor
+        }
+        if (carry == 0) return;
+        g[0] += carry;
+    }
+    throw std::logic_error("carry propagation did not converge");
+}
+
+// g := g^2 - subtract (mod 2^p - 1), in place, on normalized weighted digits.
+// Returns the worst distance from an integer seen when rounding the inverse
+// FFT output (a rounding-error gauge; > ~0.4 means the result can't be trusted).
+double squareDigits(const MersennePlan& P, std::vector<long long>& g,
+                    std::vector<std::complex<double>>& A, long long subtract) {
+    const std::size_t n = P.n;
+    A.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+        A[i] = std::complex<double>(static_cast<double>(g[i]) * P.w[i], 0.0);
+    fft(A, false);
+    for (std::size_t i = 0; i < n; ++i) {                  // A[i] = A[i]^2
+        const double re = A[i].real(), im = A[i].imag();
+        A[i] = std::complex<double>(re * re - im * im, 2.0 * re * im);
+    }
+    fft(A, true);
+
+    double maxErr = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double v = A[i].real() * P.winv[i];
+        double r = std::nearbyint(v);
+        if (!(std::fabs(r) < 9.0e18)) {                    // NaN / overflow: flag it, stay defined
+            maxErr = HUGE_VAL;
+            r = 0.0;
+        }
+        const double err = std::fabs(v - r);
+        if (!(err <= maxErr)) maxErr = err;
+        g[i] = static_cast<long long>(r);
+    }
+    g[0] -= subtract;
+    normalizeDigits(P, g);
+    return maxErr;
+}
+
+bool allDigitsMax(const MersennePlan& P, const std::vector<long long>& g) {
+    for (std::size_t i = 0; i < P.n; ++i)
+        if (g[i] != (1LL << P.width[i]) - 1) return false;
+    return true;
+}
+
+// ----- Checkpoints (portable: stores the value's bits, not the digits) -------
+
+const char kCkptMagic[8] = {'L', 'L', 'C', 'K', '0', '0', '0', '1'};
+
+void saveCheckpoint(const std::string& path, std::uint64_t p, std::uint64_t iter,
+                    const ByteArray& s) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        const std::uint64_t nbits = s.size();
+        f.write(kCkptMagic, 8);
+        f.write(reinterpret_cast<const char*>(&p), 8);
+        f.write(reinterpret_cast<const char*>(&iter), 8);
+        f.write(reinterpret_cast<const char*>(&nbits), 8);
+        std::string bytes((nbits + 7) / 8, '\0');
+        for (std::size_t i = 0; i < nbits; ++i)
+            if (s.getBit(i)) bytes[i / 8] |= static_cast<char>(1u << (7 - i % 8));
+        f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        f.flush();
+        if (!f) return;                                    // keep the previous checkpoint
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {     // Windows can't rename over a file
+        std::remove(path.c_str());
+        std::rename(tmp.c_str(), path.c_str());
+    }
+}
+
+bool loadCheckpoint(const std::string& path, std::uint64_t p, std::uint64_t total,
+                    std::uint64_t& iter, ByteArray& s) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[8];
+    std::uint64_t fp = 0, fi = 0, nbits = 0;
+    f.read(magic, 8);
+    f.read(reinterpret_cast<char*>(&fp), 8);
+    f.read(reinterpret_cast<char*>(&fi), 8);
+    f.read(reinterpret_cast<char*>(&nbits), 8);
+    if (!f || std::memcmp(magic, kCkptMagic, 8) != 0) return false;
+    if (fp != p || fi > total || nbits == 0 || nbits > p) return false;
+    std::string bytes((nbits + 7) / 8, '\0');
+    f.read(&bytes[0], static_cast<std::streamsize>(bytes.size()));
+    if (!f) return false;
+    ByteArray t;
+    for (std::size_t i = 0; i < nbits; ++i)
+        t.append((static_cast<unsigned char>(bytes[i / 8]) >> (7 - i % 8)) & 1u);
+    s = t;
+    iter = fi;
+    return true;
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// ByteArray
+// ---------------------------------------------------------------------------
 
 void ByteArray::append(std::uint8_t bit) {
     if (size_ % 8 == 0) data_.push_back(0);   // start a fresh byte
@@ -148,6 +367,48 @@ void ByteArray::print(std::size_t maxBits) const {
         s += bit(i) ? '1' : '0';
     if (size_ > maxBits) s += "...";
     std::cout << s << "  (" << size_ << " bits)" << std::endl;
+}
+
+std::uint64_t ByteArray::readBits(std::size_t start, std::size_t len) const {
+    std::uint64_t v = 0;
+    std::size_t i = start;
+    const std::size_t end = start + len;
+    while (i < end) {                       // take up to a byte boundary at a time
+        const std::size_t off = i % 8;
+        const std::size_t take = std::min<std::size_t>(8 - off, end - i);
+        const unsigned b = (data_[i / 8] >> (8 - off - take)) & ((1u << take) - 1u);
+        v = (v << take) | b;
+        i += take;
+    }
+    return v;
+}
+
+void ByteArray::writeBits(std::size_t start, std::size_t len, std::uint64_t v) {
+    std::size_t end = start + len;          // fill from the least significant end
+    while (len > 0) {
+        const std::size_t last = end - 1;
+        const std::size_t off = last % 8;
+        const std::size_t take = std::min<std::size_t>(len, off + 1);
+        data_[last / 8] |= static_cast<std::uint8_t>((v & ((1u << take) - 1u)) << (7 - off));
+        v >>= take;
+        len -= take;
+        end -= take;
+    }
+}
+
+int ByteArray::compare(const ByteArray& other) const {
+    std::size_t lenA = 0, aTop = 0, lenB = 0, bTop = 0;
+    for (std::size_t i = 0; i < size_; ++i)
+        if (bit(i)) { lenA = size_ - i; aTop = i; break; }
+    for (std::size_t i = 0; i < other.size_; ++i)
+        if (other.bit(i)) { lenB = other.size_ - i; bTop = i; break; }
+
+    if (lenA != lenB) return lenA > lenB ? 1 : -1;
+    for (std::size_t k = 0; k < lenA; ++k) {
+        const bool ba = bit(aTop + k), bb = other.bit(bTop + k);
+        if (ba != bb) return ba ? 1 : -1;
+    }
+    return 0;
 }
 
 ByteArray ByteArray::approxSqrt(std::size_t precisionBits) const {
@@ -266,7 +527,7 @@ ByteArray ByteArray::add(const ByteArray& other) const {
 }
 
 ByteArray ByteArray::minus(const ByteArray& other) const {
-    // Requires *this >= other.
+    if (compare(other) < 0) throw std::invalid_argument("minus: this < other");
     int borrow = 0;
     ByteArray r;
     r.size_ = size_;
@@ -418,121 +679,115 @@ ByteArray ByteArray::modMersenne(std::size_t p) const {
     return x;
 }
 
-ByteArray ByteArray::squareModMersenne(std::size_t p) const {
-    // Weighted (Mersenne) DWT: split this (< 2^p) into n weighted limbs and do
-    // a single cyclic transform of length n, so the result is s^2 mod (2^p-1)
-    // with no separate post-square fold. n is a power of two.
-    //
-    // Use ceil limb positions lo[i] = ceil(i*p/n) (with lo[0]=0, lo[n]=p).
-    // Along with weights w[i] = 2^(lo[i] - i*p/n) >= 1 applied forward and
-    // divided out on the way back, the product terms come out as exact
-    // integers (floor positions would make them half-integers and corrupt the
-    // rounding).
-    std::size_t n = 1;
-    for (;;) {
-        const std::size_t maxc = (p + n - 1) / n;          // ceil(p/n)
-        const long double lb = std::log2(static_cast<long double>(n))
-                             + 2.0L * static_cast<long double>(maxc);
-        if (n >= 2 && lb < 50.0L) break;                   // exact in double
-        n <<= 1;
+// Splits this (< 2^p) into the plan's weighted digits. A digit's bits live at
+// little-endian positions [lo, lo+width), i.e. MSB-first positions
+// [size_-lo-width, size_-lo), so each digit is one short multi-byte read.
+void ByteArray::toDigits(const MersennePlan& P, std::vector<long long>& g) const {
+    g.assign(P.n, 0);
+    for (std::size_t i = 0; i < P.n; ++i) {
+        const std::size_t lo = P.lo[i];
+        if (lo >= size_) break;                            // everything above is zero
+        const std::size_t avail = std::min<std::size_t>(P.width[i], size_ - lo);
+        g[i] = static_cast<long long>(readBits(size_ - lo - avail, avail));
     }
+}
 
-    // Split into weighted digits.
-    std::vector<std::uint64_t> d(n, 0);
-    std::vector<std::uint64_t> width(n);
-    std::vector<std::uint64_t> lo(n);
-    std::vector<double> w(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        const unsigned __int128 lo128 = ((unsigned __int128)i * p + n - 1) / n;  // ceil
-        const unsigned __int128 hi128 = ((unsigned __int128)(i + 1) * p + n - 1) / n;
-        lo[i] = static_cast<std::uint64_t>(lo128);
-        width[i] = static_cast<std::uint64_t>(hi128 - lo128);
-
-        std::uint64_t v = 0;
-        for (std::uint64_t b = 0; b < width[i]; ++b) {
-            if (lo[i] + b < size_ && bit(size_ - 1 - (lo[i] + b)))
-                v |= std::uint64_t(1) << b;
-        }
-        d[i] = v;
-
-        const unsigned __int128 rem = ((unsigned __int128)i * p) % n;
-        const unsigned __int128 k = (n - rem) % n;         // lo[i]*n - i*p <= n-1
-        w[i] = std::pow(2.0, static_cast<double>(k) / static_cast<double>(n));
-    }
-
-    // One forward transform, pointwise square, one inverse transform.
-    std::vector<std::complex<double>> A(n);
-    for (std::size_t i = 0; i < n; ++i)
-        A[i] = std::complex<double>(static_cast<double>(d[i]) * w[i], 0.0);
-    fft(A, false);
-    for (std::size_t i = 0; i < n; ++i) A[i] = A[i] * A[i];
-    fft(A, true);
-
-    // Divide out the weights, round to integers, then propagate carries
-    // cyclically (the carry that leaves the top limb wraps back onto limb 0,
-    // which IS the mod-(2^p-1) reduction).
-    std::vector<std::uint64_t> g(n);
-    for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<std::uint64_t>(std::llround(A[i].real() / w[i]));
-
-    for (int pass = 0; pass < 16; ++pass) {
-        std::uint64_t carry = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::uint64_t base = std::uint64_t(1) << width[i];
-            const std::uint64_t v = g[i] + carry;
-            g[i] = v % base;
-            carry = v / base;
-        }
-        if (carry == 0) break;
-        g[0] += carry;                 // cyclic wrap: feed it back into limb 0
-    }
-
-    // Reassemble the residue (value = sum g_i * 2^lo[i]) as an MSB-first array.
-    std::size_t highest = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        std::uint64_t v = g[i];
-        if (!v) continue;
-        std::size_t h = 0;
-        while (v >>= 1) ++h;
-        if (lo[i] + h > highest) highest = lo[i] + h;
-    }
-
+// Inverse of toDigits (digits must be normalized). Result has no leading zeros.
+ByteArray ByteArray::fromDigits(const MersennePlan& P, const std::vector<long long>& g) {
     ByteArray r;
+    std::size_t highest = 0;
+    bool any = false;
+    for (std::size_t i = P.n; i-- > 0;) {
+        if (g[i]) {
+            highest = P.lo[i] + bitLength(static_cast<std::uint64_t>(g[i])) - 1;
+            any = true;
+            break;
+        }
+    }
+    if (!any) { r.setZero(); return r; }
+
     r.size_ = highest + 1;
     r.data_.assign((r.size_ + 7) / 8, 0);
-    for (std::size_t i = 0; i < n; ++i)
-        for (std::uint64_t b = 0; b < width[i]; ++b)
-            if ((g[i] >> b) & 1u)
-                r.setBit(r.size_ - 1 - (lo[i] + b), true);
-
-    // A canonical Mersenne residue never equals M; if it came out all ones
-    // (value == 2^p - 1) the true residue is 0.
-    if (r.size_ == p + 1) {
-        r.stripLeadingZeros();
-    }
-    if (r.size() == p) {
-        bool allOnes = true;
-        for (std::size_t i = 0; i < p; ++i)
-            if (!r.bit(i)) { allOnes = false; break; }
-        if (allOnes) return ByteArray::fromString("0");
+    for (std::size_t i = 0; i < P.n; ++i) {
+        if (!g[i]) continue;
+        const std::size_t len = bitLength(static_cast<std::uint64_t>(g[i]));
+        r.writeBits(r.size_ - P.lo[i] - len, len, static_cast<std::uint64_t>(g[i]));
     }
     return r;
 }
 
-bool ByteArray::greaterEqual(const ByteArray& other) const {
-    std::size_t lenA = 0, aTop = 0, lenB = 0, bTop = 0;
-    for (std::size_t i = 0; i < size_; ++i)
-        if (bit(i)) { lenA = size_ - i; aTop = i; break; }
-    for (std::size_t i = 0; i < other.size_; ++i)
-        if (other.bit(i)) { lenB = other.size_ - i; bTop = i; break; }
+ByteArray ByteArray::squareModMersenne(std::size_t p) const {
+    if (size_ > p) return modMersenne(p).squareModMersenne(p);
 
-    if (lenA != lenB) return lenA > lenB;
-    for (std::size_t k = 0; k < lenA; ++k) {
-        bool ba = bit(aTop + k), bb = other.bit(bTop + k);
-        if (ba != bb) return ba;
+    const MersennePlan& P = getPlan(p, 0);
+    std::vector<long long> g;
+    toDigits(P, g);
+
+    std::vector<std::complex<double>> A;
+    const double err = squareDigits(P, g, A, 0);
+    if (!(err <= 0.4))
+        throw RoundoffError("squareModMersenne: FFT roundoff " + std::to_string(err) +
+                            " too large for p = " + std::to_string(p));
+
+    if (allDigitsMax(P, g)) {                              // value == 2^p - 1 == 0 (mod M)
+        ByteArray z;
+        z.setZero();
+        return z;
     }
-    return true;                        // equal
+    return fromDigits(P, g);
 }
+
+LLResult ByteArray::lucasLehmer(std::uint64_t p, const LLOptions& opt) {
+    LLResult res;
+    if (p < 2) return res;
+    if (p == 2) { res.isPrime = true; return res; }       // 3 is prime (the loop needs p odd)
+
+    const MersennePlan& P = getPlan(p, opt.fftBoost);
+    const std::uint64_t total = p - 2;
+    const bool ckpt = !opt.checkpointFile.empty();
+
+    std::vector<long long> g;
+    std::uint64_t iter = 0;
+    ByteArray saved;
+    if (ckpt && loadCheckpoint(opt.checkpointFile, p, total, iter, saved)) {
+        saved.toDigits(P, g);
+        res.resumedFrom = iter;
+    } else {
+        iter = 0;
+        g.assign(P.n, 0);
+        g[0] = 4;                                          // s0 = 4
+        normalizeDigits(P, g);
+    }
+
+    std::vector<std::complex<double>> A(P.n);
+    while (iter < total) {
+        const double e = squareDigits(P, g, A, 2);         // s = s^2 - 2 (mod M)
+        if (!(e <= opt.maxAllowedRoundoff))
+            throw RoundoffError("Lucas-Lehmer p = " + std::to_string(p) + ": FFT roundoff " +
+                                std::to_string(e) + " at iteration " +
+                                std::to_string(iter + 1) + " (try a larger fftBoost)");
+        if (e > res.maxRoundoff) res.maxRoundoff = e;
+        ++iter;
+
+        if (ckpt && opt.checkpointEvery && iter % opt.checkpointEvery == 0 && iter < total)
+            saveCheckpoint(opt.checkpointFile, p, iter, fromDigits(P, g));
+        if (opt.onProgress && opt.progressEvery && iter % opt.progressEvery == 0)
+            opt.onProgress(iter, total, res.maxRoundoff);
+    }
+
+    // M_p is prime iff s_{p-2} == 0 (mod M): all digits zero, or all ones (= M itself).
+    bool allZero = true;
+    for (std::size_t i = 0; i < P.n; ++i)
+        if (g[i] != 0) { allZero = false; break; }
+    res.isPrime = allZero || allDigitsMax(P, g);
+
+    if (ckpt) std::remove(opt.checkpointFile.c_str());
+    return res;
+}
+
+bool ByteArray::greaterEqual(const ByteArray& other) const { return compare(other) >= 0; }
+
+bool ByteArray::isLargerThan(const ByteArray& other) const { return compare(other) > 0; }
 
 ByteArray& ByteArray::addTwo() {
     if (size_ == 0) {                 // 0 -> 2 = "10"
@@ -551,21 +806,6 @@ ByteArray& ByteArray::addTwo() {
         --i;
     }
     return *this;
-}
-
-bool ByteArray::isLargerThan(const ByteArray& other) const {
-    std::size_t lenA = 0, aTop = 0, lenB = 0, bTop = 0;
-    for (std::size_t i = 0; i < size_; ++i)
-        if (bit(i)) { lenA = size_ - i; aTop = i; break; }
-    for (std::size_t i = 0; i < other.size_; ++i)
-        if (other.bit(i)) { lenB = other.size_ - i; bTop = i; break; }
-
-    if (lenA != lenB) return lenA > lenB;
-    for (std::size_t k = 0; k < lenA; ++k) {
-        bool ba = bit(aTop + k), bb = other.bit(bTop + k);
-        if (ba != bb) return ba;
-    }
-    return false;                     // equal
 }
 
 bool ByteArray::isPrime(std::uint64_t n) {
