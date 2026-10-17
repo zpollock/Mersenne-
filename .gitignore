@@ -1,0 +1,14 @@
+# Compiled binary
+mp
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+*.o
+*.out
